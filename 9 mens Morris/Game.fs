@@ -442,19 +442,19 @@ module MorrisBoard =
         let private WinScore = 1_000_000
 
         [<Literal>]
-        let private PieceWeightPlacing = 80
+        let private PieceWeightPlacing = 70
 
         [<Literal>]
         let private PieceWeightMoving = 130
 
         [<Literal>]
-        let private MillWeightPlacing = 140
+        let private MillWeightPlacing = 160
 
         [<Literal>]
         let private MillWeightMoving = 110
 
         [<Literal>]
-        let private PotentialMillWeightPlacing = 60
+        let private PotentialMillWeightPlacing = 45
 
         [<Literal>]
         let private PotentialMillWeightMoving = 35
@@ -466,16 +466,22 @@ module MorrisBoard =
         let private BlockedWeight = 40
 
         [<Literal>]
-        let private DoubleThreatWeight = 140
+        let private DoubleThreatWeight = 160
 
         [<Literal>]
-        let private ImmediateThreatWeight = 220
+        let private ImmediateThreatWeight = 5000
+
+        [<Literal>]
+        let private PlacementThreatWeight = 2500
 
         [<Literal>]
         let private RemoveBonus = 140
 
         [<Literal>]
-        let private DefaultDepth = 5
+        let private PlacementDepth = 7
+
+        [<Literal>]
+        let private MovingDepth = 6
 
         let private isPlacementPhase (state: GameState) =
             state.WhitePlaced < stonesPerSide || state.BlackPlaced < stonesPerSide
@@ -503,7 +509,6 @@ module MorrisBoard =
                         | _ -> 0)
 
                 let empty = 3 - mine - enemy
-
                 if mine = 2 && empty = 1 && enemy = 0 then 1 else 0)
 
         let private blockedPieces player (state: GameState) =
@@ -557,15 +562,21 @@ module MorrisBoard =
                     | Move _ -> 1
                     | _ -> 0)
 
+        let private placementThreatSquares player (state: GameState) =
+            [ 0 .. pointCount - 1 ]
+            |> List.filter (fun p ->
+                isEmpty p state && wouldFormMillAfterPlacement player p state)
+
+        let private placementThreatCount player (state: GameState) =
+            placementThreatSquares player state |> List.length
+
         let private immediateMillThreatCount player (state: GameState) =
             if state.Phase = Removing || state.Phase = GameOver then
                 0
             else
                 match state.Phase with
                 | Placing ->
-                    [ 0 .. pointCount - 1 ]
-                    |> List.sumBy (fun p ->
-                        if isEmpty p state && wouldFormMillAfterPlacement player p state then 1 else 0)
+                    placementThreatCount player state
 
                 | Moving ->
                     let mine =
@@ -586,6 +597,33 @@ module MorrisBoard =
 
                 | _ ->
                     0
+
+        let private createsFuturePlacementThreat player point (state: GameState) =
+            if not (isEmpty point state) then
+                false
+            else
+                let nextState = applyAction (Place point) state
+                placementThreatCount player nextState > placementThreatCount player state
+
+        let private leavesOpponentImmediateMill action (state: GameState) =
+            let opp = state.NextToMove.Other
+            let nextState = applyAction action state
+            immediateMillThreatCount opp nextState > 0
+
+        let private urgentDefensiveActions (state: GameState) (actions: Action list) =
+            let opp = state.NextToMove.Other
+            let before = immediateMillThreatCount opp state
+
+            if before = 0 then
+                actions
+            else
+                let blockers =
+                    actions
+                    |> List.filter (fun a ->
+                        let nextState = applyAction a state
+                        immediateMillThreatCount opp nextState < before)
+
+                if List.isEmpty blockers then actions else blockers
 
         let private evaluateFor (player: Player) (state: GameState) =
             let opp = player.Other
@@ -609,11 +647,22 @@ module MorrisBoard =
                 let myImmediateThreats = immediateMillThreatCount player state
                 let oppImmediateThreats = immediateMillThreatCount opp state
 
+                let myPlacementThreats = placementThreatCount player state
+                let oppPlacementThreats = placementThreatCount opp state
+
                 let removeScore =
                     if state.Phase = Removing && state.NextToMove = player then
                         RemoveBonus
                     elif state.Phase = Removing && state.NextToMove = opp then
                         -RemoveBonus
+                    else
+                        0
+
+                let emergencyThreatPenalty =
+                    if oppImmediateThreats > 0 then
+                        -8000 * oppImmediateThreats
+                    elif myImmediateThreats > 0 then
+                        5000 * myImmediateThreats
                     else
                         0
 
@@ -623,7 +672,9 @@ module MorrisBoard =
                     + (myPotential - oppPotential) * PotentialMillWeightPlacing
                     + (myDoubleThreats - oppDoubleThreats) * DoubleThreatWeight
                     + (myImmediateThreats - oppImmediateThreats) * ImmediateThreatWeight
+                    + (myPlacementThreats - oppPlacementThreats) * PlacementThreatWeight
                     + removeScore
+                    + emergencyThreatPenalty
                 else
                     let myMobility = mobilityFor player state
                     let oppMobility = mobilityFor opp state
@@ -639,6 +690,7 @@ module MorrisBoard =
                     + (myDoubleThreats - oppDoubleThreats) * DoubleThreatWeight
                     + (myImmediateThreats - oppImmediateThreats) * ImmediateThreatWeight
                     + removeScore
+                    + emergencyThreatPenalty
 
         let private moveOrderingScore (state: GameState) (action: Action) =
             let me = state.NextToMove
@@ -657,23 +709,41 @@ module MorrisBoard =
                 let after = immediateMillThreatCount opp nextState
                 if before > 0 && after < before then 1 else 0
 
+            let leavesThreat =
+                if leavesOpponentImmediateMill action state then 1 else 0
+
+            let createsPlacementThreat =
+                match action with
+                | Place p ->
+                    if createsFuturePlacementThreat me p state then 1 else 0
+                | _ ->
+                    0
+
             let removeScore =
                 match action with
                 | Remove p ->
                     let inMill = stateHasMillAt p opp state
                     if inMill then 40 else 220
-                | _ -> 0
+                | _ ->
+                    0
 
             let centralityScore =
                 match action with
-                | Place p -> neighbors[p].Length * 5
-                | Move (_, toPoint) -> neighbors[toPoint].Length * 5
+                | Place _ -> 0
+                | Move (_, toPoint) -> neighbors[toPoint].Length * 3
                 | Remove _ -> 0
 
-            formsMill * 1000 + blocksOppImmediateMill * 900 + removeScore + centralityScore
+            formsMill * 1500
+            + blocksOppImmediateMill * 10000
+            - leavesThreat * 9000
+            + createsPlacementThreat * 1200
+            + removeScore
+            + centralityScore
 
         let private orderActions (state: GameState) (actions: Action list) =
-            actions |> List.sortByDescending (moveOrderingScore state)
+            actions
+            |> urgentDefensiveActions state
+            |> List.sortByDescending (moveOrderingScore state)
 
         let private boardSignature (state: GameState) =
             let boardPart =
@@ -767,7 +837,6 @@ module MorrisBoard =
                     (System.Int32.MinValue / 4)
                     (System.Int32.MaxValue / 4)
                     Set.empty
-
             action
 
         let chooseActionIterative maxDepth (state: GameState) : Action option =
@@ -781,4 +850,7 @@ module MorrisBoard =
             bestAction
 
         let chooseAction (state: GameState) : Action option =
-            chooseActionIterative DefaultDepth state
+            if isPlacementPhase state then
+                chooseActionIterative PlacementDepth state
+            else
+                chooseActionIterative MovingDepth state
